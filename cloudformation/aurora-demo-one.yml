@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  UserName:
+    Description: "User name."
+    Type: String
+  RDSMasterInstanceClass:
+    Description: "Aurora Instance class."
+    ConstraintDescription: 'must be a valid instance type.'
+    Type: String
+    AllowedValues: [
+      "db.t2.small",
+      "db.t2.medium",
+      "db.r3.large",
+      "db.r3.xlarge",
+      "db.r3.2xlarge",
+      "db.r3.4xlarge",
+      "db.r3.8xlarge"
+    ]
+  RDSReplicaInstanceClass:
+    Description: "Aurora Instance class."
+    ConstraintDescription: 'must be a valid instance type.'
+    Type: String
+    AllowedValues: [
+      "db.t2.small",
+      "db.t2.medium",
+      "db.r3.large",
+      "db.r3.xlarge",
+      "db.r3.2xlarge",
+      "db.r3.4xlarge",
+      "db.r3.8xlarge"
+    ]
+  RDSMasterUserName:
+    Description: "Database admin username."
+    Type: String
+  RDSMasterUserPassword:
+    NoEcho: true
+    Type: String
+    Description: "DB Cluster Master user password."
+    MinLength: "20"
+  Vpc:
+    Description: "VPC ID"
+    Type: String
+
+Resources:
+  AuroraS3:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+
+  AuroraManagementUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref UserName
+      Policies:
+      - PolicyName: "internal-data"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:getObject
+            - s3:listBucket
+            - s3:PutObject
+            Resource:
+              - !Join [ '', [ 'arn:aws:s3:::', !Ref AuroraS3 ]]
+              - !Join [ '', [ 'arn:aws:s3:::', !Ref AuroraS3, '/*' ]]
+      - PolicyName: "rds-db-connect"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - rds-db:connect
+            Resource: !Join [ '', [
+              "arn:aws:rds-db:::dbuser:*/", !Ref UserName
+            ]]
+      - PolicyName: "load-gdelt"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:getObject
+            - s3:listBucket
+            Resource: 'arn:aws:s3:::gdelt-open-data*'
+
+  RdsMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - monitoring.rds.amazonaws.com
+          Action:
+          - sts:AssumeRole
+
+  AuroraClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: "/aurora/"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - rds.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: "load-gdelt"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:getObject
+            - s3:listBucket
+            Resource: 'arn:aws:s3:::gdelt-open-data*'
+      - PolicyName: "load-internal-data"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:getObject
+            - s3:listBucket
+            - s3:GetBucketLocation
+            Resource: !Join [ '', [
+                'arn:aws:s3:::', !Ref AuroraS3
+            ]]
+      - PolicyName: "outfile-internal-data"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:ListMultipartUploadParts
+            - s3:AbortMultipartUpload
+            - s3:ListBucketMultipartUploads
+            Resource:
+              - !Join [ '', [ 'arn:aws:s3:::', !Ref AuroraS3, '/export' ]]
+              - !Join [ '', [ 'arn:aws:s3:::', !Ref AuroraS3, '/export/*' ]]
+
+  SgRdsAllAllow:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Allow from anywhere!"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        -
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        -
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  RDSClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: !Join ['', [!Ref "AWS::StackName", ' Cluster Parameter Group']]
+      Family: aurora5.6
+      Parameters:
+        time_zone: Europe/Paris
+        aws_default_s3_role: !GetAtt AuroraClusterRole.Arn
+
+  RDSCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora
+      Port: 3306
+      StorageEncrypted: true
+      DatabaseName: "awsMeetupAurora"
+      MasterUsername: !Ref RDSMasterUserName
+      MasterUserPassword: !Ref RDSMasterUserPassword
+      DBClusterParameterGroupName: !Ref RDSClusterParameterGroup
+      VpcSecurityGroupIds:
+        - !Ref SgRdsAllAllow
+
+  DatabaseRdsMaster:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora
+      DBClusterIdentifier: !Ref RDSCluster
+      PubliclyAccessible: true
+      DBInstanceClass: !Ref RDSMasterInstanceClass
+      MonitoringInterval: 5
+      MonitoringRoleArn: !GetAtt RdsMonitoringRole.Arn
+
+  DatabaseRdsReplica:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora
+      DBClusterIdentifier: !Ref RDSCluster
+      PubliclyAccessible: true
+      DBInstanceClass: !Ref RDSReplicaInstanceClass
+      MonitoringInterval: 5
+      MonitoringRoleArn: !GetAtt RdsMonitoringRole.Arn
